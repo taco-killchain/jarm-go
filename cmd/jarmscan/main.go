@@ -26,6 +26,7 @@ var workerCount = flag.Int("w", 256, "worker count")
 var quietMode = flag.Bool("q", false, "quiet mode")
 var retries = flag.Int("r", 3, "number of times to retry dialing")
 var timeout = flag.Int("t", 2, "connection timeout in seconds")
+var inputFilePath = flag.String("i", "", "input file path")
 
 // ValidPort determines if a port number is valid
 func ValidPort(pnum int) bool {
@@ -182,8 +183,8 @@ type result struct {
 func main() {
 	flag.Parse()
 
-	if len(os.Args) < 2 {
-		log.Fatalf("usage: ./jarm -p <ports> [host] <host:8443> <https://host:port> <host,port>...")
+	if *inputFilePath == "" {
+		log.Fatalf("usage: ./jarm -p <ports> -i <input_file_path>")
 	}
 
 	if *workerCount < 1 {
@@ -219,7 +220,6 @@ func main() {
 			} else {
 				fmt.Printf("JARM\t%24s:%d\t%s\n", o.Target.Host, o.Target.Port, o.Hash)
 			}
-
 		}
 	}()
 
@@ -230,60 +230,26 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for t := range tch {
-								Fingerprint(t, och)
+				Fingerprint(t, och)
 			}
 		}()
 	}
 
-	// Process targets
-	for _, s := range flag.Args() {
-		// ... Parsing target host and port remains the same ...
+	// Process targets from file
+	file, err := os.Open(*inputFilePath)
+	if err != nil {
+		log.Fatalf("failed to open file: %s", err)
+	}
+	defer file.Close()
 
-		t := target{}
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		host := scanner.Text()
+		processHost(host, defaultPorts, tch, *retries)
+	}
 
-		// Try parsing as a URL first
-		if u, err := url.Parse(s); err == nil {
-			t.Host = u.Hostname()
-			port, _ := strconv.Atoi(u.Port())
-			t.Port = port
-		}
-
-		// Next try parsing as an address:port pair
-		if t.Host == "" {
-			host, portStr, _ := net.SplitHostPort(s)
-			port, _ := strconv.Atoi(portStr)
-			t.Host = host
-			t.Port = port
-		}
-
-		// Next try parsing as a host,port pair
-		if t.Host == "" {
-			bits := strings.SplitN(s, ",", 2)
-			if len(bits) == 2 && bits[0] != "" {
-				t.Host = bits[0]
-				port, _ := strconv.Atoi(bits[1])
-				t.Port = port
-
-			}
-		}
-
-		// Finally try parsing as a host:port pair
-		if t.Host == "" {
-			bits := strings.SplitN(s, ":", 2)
-			if bits[0] != "" {
-				t.Host = bits[0]
-			}
-			if len(bits) == 2 && bits[0] != "" {
-				port, _ := strconv.Atoi(bits[1])
-				t.Port = port
-			}
-		}
-
-		hosts := []string{t.Host}
-
-		for _, host := range hosts {
-			processHost(host, defaultPorts, tch, *retries)
-		}
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("error reading from file: %s", err)
 	}
 
 	// Close the target channel and wait for workers to finish
@@ -294,7 +260,6 @@ func main() {
 	close(och)
 	wgo.Wait()
 }
-
 
 
 
