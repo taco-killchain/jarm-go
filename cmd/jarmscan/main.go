@@ -24,7 +24,8 @@ var Version = "dev"
 var defaultPorts = flag.String("p", "443", "default ports")
 var workerCount = flag.Int("w", 256, "worker count")
 var quietMode = flag.Bool("q", false, "quiet mode")
-var retries = flag.Int("r", 0, "number of times to retry dialing")
+var retries = flag.Int("r", 3, "number of times to retry dialing")
+var timeout = flag.Int("t", 2, "connection timeout in seconds")
 
 // ValidPort determines if a port number is valid
 func ValidPort(pnum int) bool {
@@ -106,22 +107,20 @@ func Fingerprint(t target, och chan result) {
 
 	results := []string{}
 	for _, probe := range jarm.GetProbes(t.Host, t.Port) {
-		dialer := proxy.FromEnvironmentUsing(&net.Dialer{Timeout: time.Second * 2})
+		dialer := proxy.FromEnvironmentUsing(&net.Dialer{Timeout: time.Second * time.Duration(*timeout)})
 		addr := net.JoinHostPort(t.Host, fmt.Sprintf("%d", t.Port))
 
 		c := net.Conn(nil)
 		n := 0
 
 		for c == nil && n <= t.Retries {
-			// Ignoring error since error message was already being dropped.
-			// Also, if theres an error, c == nil.
 			if c, _ = dialer.Dial("tcp", addr); c != nil || t.Retries == 0 {
 				break
 			}
 
 			bo := t.Backoff
 			if bo == nil {
-				bo = DefualtBackoff
+				bo = DefaultBackoff
 			}
 
 			time.Sleep(bo(n, t.Retries))
@@ -201,21 +200,10 @@ func main() {
 		log.Fatalf("invalid ports: %s", err)
 	}
 
-	tch := make(chan target, 1)
-	och := make(chan result, 1)
+	tch := make(chan target, *workerCount)
+	och := make(chan result, *workerCount)
 
 	wgo := sync.WaitGroup{}
-	wgt := sync.WaitGroup{}
-
-	for x := 0; x <= *workerCount; x++ {
-		wgt.Add(1)
-		go func() {
-			defer wgt.Done()
-			for t := range tch {
-				Fingerprint(t, och)
-			}
-		}()
-	}
 
 	// Output consolidator
 	wgo.Add(1)
@@ -235,8 +223,21 @@ func main() {
 		}
 	}()
 
+	// Worker pool
+	var wg sync.WaitGroup
+	for i := 0; i < *workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for t := range tch {
+								Fingerprint(t, och)
+			}
+		}()
+	}
+
 	// Process targets
 	for _, s := range flag.Args() {
+		// ... Parsing target host and port remains the same ...
 
 		t := target{}
 
@@ -281,51 +282,29 @@ func main() {
 		hosts := []string{t.Host}
 
 		for _, host := range hosts {
-
-			// Support CIDR networks as targets
-			hch := make(chan string, 1)
-			qch := make(chan int, 1)
-			hwg := sync.WaitGroup{}
-			hwg.Add(1)
-
-			go func() {
-				defer hwg.Done()
-				for thost := range hch {
-					ports := defaultPorts
-					if t.Port != 0 {
-						ports = []int{t.Port}
-					}
-					for _, port := range ports {
-						tch <- target{
-							Host: thost,
-							Port: port,
-
-							Retries: *retries,
-						}
-					}
-				}
-			}()
-
-			// Try to iterate the host as a CIDR range
-			herr := jarm.AddressesFromCIDR(host, hch, qch)
-
-			// Not a parseable range, handle it as a bare host instead
-			if herr != nil {
-				hch <- host
-			}
-
-			// Wrap up and wait
-			close(hch)
-			hwg.Wait()
-			close(qch)
+			processHost(host, defaultPorts, tch, *retries)
 		}
 	}
 
-	// Wait for scans to complete
+	// Close the target channel and wait for workers to finish
 	close(tch)
-	wgt.Wait()
+	wg.Wait()
 
 	// Wait for output to finish
 	close(och)
 	wgo.Wait()
+}
+
+
+
+
+func processHost(host string, defaultPorts []int, tch chan target, retries int) {
+	ports := defaultPorts
+	for _, port := range ports {
+		tch <- target{
+			Host:    host,
+			Port:    port,
+			Retries: retries,
+		}
+	}
 }
